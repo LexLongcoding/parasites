@@ -88,6 +88,7 @@ class Ui {
   void CalibrateHigh();
 
   void UpdateSettings();
+  void DisplayTuner();
 
   stmlib::EventQueue<16> queue_;
   

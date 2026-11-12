@@ -78,6 +78,23 @@ void Modulator::Init(float sample_rate) {
   filter_[1].Init();
   filter_[2].Init();
   filter_[3].Init();
+
+  fill(&tuner_.lp[0], &tuner_.lp[2], 0.0f);
+  tuner_.dc = 0.0f;
+  tuner_.envelope = 0.0f;
+  tuner_.negative_envelope = 0.0f;
+  tuner_.previous = 0.0f;
+  tuner_.armed = false;
+  tuner_.since_crossing = 0.0f;
+  tuner_.period_sum = 0.0f;
+  tuner_.period_count = 0;
+  tuner_.silence = 0;
+  tuner_.first_crossing = true;
+  tuner_.has_signal = false;
+  tuner_.cents = 0.0f;
+  tuner_.reference_on = false;
+  tuner_.reference_phase = 0.0f;
+  tuner_.reference_level = 0.0f;
 }
 
 void Modulator::ProcessFreqShifter(
@@ -779,110 +796,130 @@ void Modulator::ProcessDelay(ShortFrame* input, ShortFrame* output, size_t size)
   previous_parameters_ = parameters_;
 }
 
-void Modulator::ProcessDoppler(ShortFrame* input, ShortFrame* output, size_t size) {
-  ShortFrame *buffer = delay_buffer_;
+// Tuner: measures the pitch of the signal present on the inputs (IN 1 + IN 2,
+// unpatched inputs are silenced by the normalization detector) and reports
+// its deviation from middle C. Also renders an optional reference sine wave
+// at middle C.
+//
+// Outputs:
+//   OUT: input pass-through, mixed with the reference when it is on (so you
+//        can hear the beating between your oscillator and the reference).
+//   AUX: the reference alone (silent when the reference is off).
+namespace {
 
-  static size_t cursor = 0;
-  static float lfo_phase = 0.0f;
-  static float distance = 1.0f;
-  static float angle = 1.0f;
+const float kTunerSampleRate = 96000.0f;
+const float kMiddleC = 261.6255653f;  // C4, A4 = 440 Hz
+// Pitch is averaged over windows of at least this many samples (~50 ms).
+const float kTunerWindow = kTunerSampleRate * 0.05f;
+// No crossing for this long (~150 ms) means "no signal".
+const int32_t kTunerTimeout = 96000 * 15 / 100;
+// Below this level (filtered, full-scale = 1.0) the input is ignored.
+const float kTunerGate = 0.003f;
+// Hysteresis of the zero-crossing detector, relative to the envelope.
+const float kTunerHysteresis = 0.3f;
+// 2-pole low-pass at ~600 Hz to tame harmonics; DC blocker at ~10 Hz.
+const float kTunerLpCoefficient = 2.0f * 3.14159265f * 600.0f / kTunerSampleRate;
+const float kTunerDcCoefficient = 2.0f * 3.14159265f * 10.0f / kTunerSampleRate;
+const float kReferenceIncrement = kMiddleC / kTunerSampleRate;
+const float kReferenceAmplitude = 0.4f;  // relative to full scale
 
-  float x = previous_parameters_.raw_algorithm * 2.0f - 1.0f;
-  float x_end = parameters_.raw_algorithm * 2.0f - 1.0f;
+}  // namespace
 
-  float y = previous_parameters_.modulation_parameter * 2.0f;
-  float y_end = parameters_.modulation_parameter * 2.0f;
-
-  float lfo_freq = parameters_.channel_drive[0]
-    * parameters_.channel_drive[0]
-    * 50.0f;
-  float lfo_amplitude = parameters_.channel_drive[1];
-
-  float step = 1.0f / static_cast<float>(size);
-  float x_increment = (x_end - x) * step;
-  float y_increment = (y_end - y) * step;
-
-  int8_t shape = parameters_.carrier_shape;
-
-  float atten_factor =
-    shape == 0 ? 0.5f :
-    shape == 1 ? 4.0f :
-    shape == 2 ? 8.0f :
-    shape == 3 ? 15.0f : 0;
-
-  float room_size =
-    shape == 0 ? 100 :
-    shape == 1 ? (DELAY_SIZE - 1) / 10.0f :
-    shape == 2 ? (DELAY_SIZE - 1) / 5.0f :
-    shape == 3 ? (DELAY_SIZE - 1) / 2.0f : 0;
+void Modulator::ProcessTuner(ShortFrame* input, ShortFrame* output, size_t size) {
+  TunerState& t = tuner_;
+  const float reference_target = t.reference_on ? kReferenceAmplitude : 0.0f;
 
   while (size--) {
+    float in = (static_cast<float>(input->l) + static_cast<float>(input->r)) \
+        / 32768.0f;
 
-    // write input to buffer
-    buffer[cursor].l = input->l;
-    buffer[cursor].r = input->r;
+    // --- Analysis --------------------------------------------------------
+    // DC blocker.
+    t.dc += kTunerDcCoefficient * (in - t.dc);
+    float x = in - t.dc;
+    // Low-pass.
+    t.lp[0] += kTunerLpCoefficient * (x - t.lp[0]);
+    t.lp[1] += kTunerLpCoefficient * (t.lp[0] - t.lp[1]);
+    x = t.lp[1];
 
-    // LFOs
-    float sin = Interpolate(lut_sin, lfo_phase, 1024.0f);
-    float cos = Interpolate(lut_sin + 256, lfo_phase, 1024.0f);
+    // Separate positive/negative peak followers (instant attack, ~200 ms
+    // release), so that lopsided waveforms like narrow pulses still trigger.
+    if (x > t.envelope) {
+      t.envelope = x;
+    } else {
+      t.envelope *= 0.99995f;
+    }
+    if (-x > t.negative_envelope) {
+      t.negative_envelope = -x;
+    } else {
+      t.negative_envelope *= 0.99995f;
+    }
 
-    float x_lfo = x + sin * lfo_amplitude + 0.05f; // offset avoids discontinuity at 0
-    float y_lfo = y + cos  * lfo_amplitude;
-    CONSTRAIN(x_lfo, -1.0f, 1.0f);
-    CONSTRAIN(y_lfo, -1.0f, 2.0f);
+    const float threshold = t.negative_envelope * kTunerHysteresis;
+    t.since_crossing += 1.0f;
+    ++t.silence;
 
-    // compute angular coordinates
-    float di = sqrtf(x_lfo * x_lfo + y_lfo * y_lfo); // 0..sqrt(5)
-    float an = Interpolate(lut_arcsin, (x_lfo/di + 1.0f) * 0.5f, 256.0f);
-    di /= 2.237;		// sqrt(5)
+    if (t.envelope + t.negative_envelope > 2.0f * kTunerGate) {
+      if (x < -threshold) {
+        t.armed = true;
+      } else if (t.armed && t.previous < 0.0f && x >= 0.0f) {
+        // Upward zero crossing. Sub-sample position by linear interpolation:
+        // the crossing happened 'fraction' samples before the current one.
+        t.armed = false;
+        float fraction = x / (x - t.previous);
+        float period = t.since_crossing - fraction;
+        t.since_crossing = fraction;
+        if (t.first_crossing) {
+          t.first_crossing = false;
+        } else {
+          t.period_sum += period;
+          ++t.period_count;
+          t.silence = 0;
+          if (t.period_sum >= kTunerWindow && t.period_count >= 2) {
+            float frequency = kTunerSampleRate * \
+                static_cast<float>(t.period_count) / t.period_sum;
+            float cents = 1200.0f * log2f(frequency / kMiddleC);
+            if (!t.has_signal || fabs(cents - t.cents) > 30.0f) {
+              t.cents = cents;  // Big jump: follow immediately.
+            } else {
+              t.cents += 0.5f * (cents - t.cents);  // Small jitter: smooth.
+            }
+            t.has_signal = true;
+            t.period_sum = 0.0f;
+            t.period_count = 0;
+          }
+        }
+      }
+    }
 
-    ONE_POLE(distance, di, 0.001f);
-    ONE_POLE(angle, an, 0.001f);
+    if (t.silence > kTunerTimeout) {
+      t.has_signal = false;
+      t.first_crossing = true;
+      t.armed = false;
+      t.period_sum = 0.0f;
+      t.period_count = 0;
+      t.silence = 0;
+    }
+    t.previous = x;
 
-    // compute binaural delay
-    float binaural_delay = angle * (96000.0f * 0.0015f); // -1.5ms..1.5ms
-    float delay_l = distance * room_size + (angle > 0 ? binaural_delay : 0);
-    float delay_r = distance * room_size + (angle < 0 ? -binaural_delay : 0);
+    // --- Reference oscillator ---------------------------------------------
+    t.reference_level += 0.001f * (reference_target - t.reference_level);
+    float reference = 0.0f;
+    if (t.reference_level > 0.0001f) {
+      reference = Interpolate(lut_sin, t.reference_phase, 1024.0f) * \
+          t.reference_level;
+    }
+    t.reference_phase += kReferenceIncrement;
+    if (t.reference_phase >= 1.0f) {
+      t.reference_phase -= 1.0f;
+    }
 
-    // linear delay interpolation
-    MAKE_INTEGRAL_FRACTIONAL(delay_l);
-    MAKE_INTEGRAL_FRACTIONAL(delay_r);
+    // --- Outputs ------------------------------------------------------------
+    output->l = Clip16(static_cast<int32_t>((in + reference) * 32768.0f));
+    output->r = Clip16(static_cast<int32_t>(reference * 32768.0f));
 
-    int16_t index_l = cursor - delay_l_integral;
-    if (index_l < 0) index_l += DELAY_SIZE;
-    int16_t index_r = cursor - delay_r_integral;
-    if (index_r < 0) index_r += DELAY_SIZE;
-
-    ShortFrame a_l = buffer[index_l];
-    ShortFrame b_l = buffer[index_l == 0 ? DELAY_SIZE - 1 : index_l - 1];
-    ShortFrame a_r = buffer[index_r];
-    ShortFrame b_r = buffer[index_r == 0 ? DELAY_SIZE - 1 : index_r - 1];
-
-    short s1_l = a_l.l + (b_l.l - a_l.l) * delay_l_fractional;
-    short s2_l = a_l.r + (b_l.r - a_l.r) * delay_l_fractional;
-    short s1_r = a_r.l + (b_r.l - a_r.l) * delay_r_fractional;
-    short s2_r = a_r.r + (b_r.r - a_r.r) * delay_r_fractional;
-
-    // distance attenuation
-    float atten = 1.0f + atten_factor * distance * distance;
-    s1_l /= atten;
-    s2_l /= atten;
-    s1_r /= atten;
-    s2_r /= atten;
-
-    float fade_in = Interpolate(lut_xfade_in, (angle + 1.0f) / 2.0f, 256.0f);
-    float fade_out = Interpolate(lut_xfade_out, (angle + 1.0f) / 2.0f, 256.0f);
-
-    output->l = s2_l * fade_in + s1_l * fade_out;
-    output->r = s1_r * fade_in + s2_r * fade_out;
-
-    x += x_increment;
-    y += y_increment;
-    lfo_phase += lfo_freq / 96000.0f;
-    if (lfo_phase > 1.0f) lfo_phase--;
     input++;
     output++;
-    cursor = (cursor + 1) % DELAY_SIZE;
   }
 
   previous_parameters_ = parameters_;
@@ -896,8 +933,8 @@ void Modulator::Process(ShortFrame* input, ShortFrame* output, size_t size) {
 
   switch (feature_mode_) {
 
-  case FEATURE_MODE_DOPPLER:
-    ProcessDoppler(input, output, size);
+  case FEATURE_MODE_TUNER:
+    ProcessTuner(input, output, size);
     break;
 
   case FEATURE_MODE_FOLD:

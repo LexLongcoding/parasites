@@ -29,6 +29,7 @@
 #include "warps/ui.h"
 
 #include <algorithm>
+#include <cmath>
 
 #include "stmlib/system/system_clock.h"
 #include "stmlib/dsp/units.h"
@@ -141,6 +142,10 @@ void Ui::Poll() {
 
   switch (mode_) {
     case UI_MODE_NORMAL:
+      if (modulator_->feature_mode() == FEATURE_MODE_TUNER) {
+        DisplayTuner();
+        break;
+      }
       {
         uint8_t rgb[3];
         float zone;
@@ -235,6 +240,52 @@ void Ui::Poll() {
   leds_.Write();
 }
 
+// Tuner display, on the algorithm knob LED:
+//   - no signal:           dim white, slowly breathing.
+//   - in tune (+/- 3 ct):  bright green.
+//   - flat:                fades from green to red as you get further away.
+//   - sharp:               fades from green to blue as you get further away.
+//   - more than 50 cents off: full red (flat) or blue (sharp), blinking.
+//     Blinking gets faster when more than a semitone off.
+// The internal oscillator LED is green when the middle C reference is on.
+void Ui::DisplayTuner() {
+  uint32_t ms = system_clock.milliseconds();
+  leds_.set_osc(0, modulator_->tuner_reference() ? 255 : 0);
+
+  if (!modulator_->tuner_has_signal()) {
+    uint8_t ramp = (ms >> 3) & 255;
+    uint8_t tri = ramp < 128 ? ramp : 255 - ramp;
+    uint8_t v = 8 + (tri >> 2);
+    leds_.set_main(v, v, v);
+    return;
+  }
+
+  const float kInTune = 3.0f;
+  const float kRange = 50.0f;
+  float cents = modulator_->tuner_cents();
+  float deviation = fabs(cents);
+  bool flat = cents < 0.0f;
+
+  if (deviation <= kInTune) {
+    leds_.set_main(0, 255, 0);
+  } else if (deviation <= kRange) {
+    // 0 = green, 1 = red (flat) or blue (sharp).
+    float amount = (deviation - kInTune) / (kRange - kInTune);
+    // Perceptually, make the first few cents count more.
+    amount = sqrtf(amount);
+    uint8_t off = static_cast<uint8_t>(255.0f * amount);
+    uint8_t on = 255 - off;
+    leds_.set_main(flat ? off : 0, on, flat ? 0 : off);
+  } else {
+    // Way off. Blink, faster when more than a semitone away.
+    bool blink = deviation > 100.0f
+        ? (ms & 127) > 64
+        : (ms & 511) > 256;
+    uint8_t v = blink ? 255 : 0;
+    leds_.set_main(flat ? v : 0, 0, flat ? 0 : v);
+  }
+}
+
 void Ui::OnSwitchPressed(const Event& e) {
   switch (e.control_id) {
     case 0:
@@ -287,8 +338,11 @@ void Ui::OnSwitchReleased(const Event& e) {
          mode_ = UI_MODE_NORMAL;
          if (feature_mode_changed_) {
            feature_mode_changed_ = false;
-         }
-         else {
+         } else if (modulator_->feature_mode() == FEATURE_MODE_TUNER) {
+           // In tuner mode, the button turns the middle C reference on/off
+           // instead of cycling through the internal oscillator shapes.
+           modulator_->toggle_tuner_reference();
+         } else {
            carrier_shape_ = (carrier_shape_ + 1) & 3;
          }
          UpdateSettings();

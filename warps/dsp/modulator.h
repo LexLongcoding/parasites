@@ -155,7 +155,7 @@ class Modulator {
   void ProcessVocoder(ShortFrame* input, ShortFrame* output, size_t size);
   void ProcessBitcrusher(ShortFrame* input, ShortFrame* output, size_t size);
   void ProcessDelay(ShortFrame* input, ShortFrame* output, size_t size);
-  void ProcessDoppler(ShortFrame* input, ShortFrame* output, size_t size);
+  void ProcessTuner(ShortFrame* input, ShortFrame* output, size_t size);
   void ProcessMeta(ShortFrame* input, ShortFrame* output, size_t size);
   inline Parameters* mutable_parameters() { return &parameters_; }
   inline const Parameters& parameters() { return parameters_; }
@@ -165,6 +165,17 @@ class Modulator {
 
   inline FeatureMode feature_mode() const { return feature_mode_; }
   inline void set_feature_mode(FeatureMode feature_mode) { feature_mode_ = feature_mode; }
+
+  // Tuner.
+  inline bool tuner_reference() const { return tuner_.reference_on; }
+  inline void set_tuner_reference(bool on) { tuner_.reference_on = on; }
+  inline void toggle_tuner_reference() {
+    tuner_.reference_on = !tuner_.reference_on;
+  }
+  // True when a stable periodic signal is detected on the inputs.
+  inline bool tuner_has_signal() const { return tuner_.has_signal; }
+  // Deviation from middle C (C4, 261.63 Hz), in cents. Negative = flat.
+  inline float tuner_cents() const { return tuner_.cents; }
 
  private:
   template<XmodAlgorithm algorithm_1, XmodAlgorithm algorithm_2>
@@ -295,6 +306,29 @@ class Modulator {
   bool bypass_;
 
   FeatureMode feature_mode_;
+
+  struct TunerState {
+    // Analysis.
+    float dc;               // DC blocker state
+    float lp[2];            // 2-pole low-pass state
+    float envelope;         // positive peak follower
+    float negative_envelope;  // negative peak follower
+    float previous;         // previous filtered sample
+    bool armed;             // Schmitt trigger: went below the low threshold
+    float since_crossing;   // samples since last upward zero crossing
+    float period_sum;       // accumulated periods in current window
+    int32_t period_count;   // number of periods in current window
+    int32_t silence;        // samples since last valid crossing
+    bool first_crossing;    // no reference crossing yet
+    // Results (read by the UI).
+    volatile bool has_signal;
+    volatile float cents;
+    // Reference oscillator.
+    volatile bool reference_on;
+    float reference_phase;
+    float reference_level;  // smoothed, for click-free on/off
+  };
+  TunerState tuner_;
 
   Parameters parameters_;
   Parameters previous_parameters_;
