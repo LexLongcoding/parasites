@@ -50,3 +50,48 @@ off at power-up.
 - **AUX**: the reference alone (a pure sine at moderate level), silent when it is off.
 
 Your saved internal-oscillator shape for the other modes is left untouched.
+
+## Building from source
+
+Tested on Ubuntu (WSL) with the Arm GCC 7-2018-q2 toolchain and Python 2.7.
+
+```bash
+# Tools
+sudo apt install -y build-essential bzip2 curl
+cd ~
+curl -L -o gcc-arm.tar.bz2 https://developer.arm.com/-/media/Files/downloads/gnu-rm/7-2018q2/gcc-arm-none-eabi-7-2018-q2-update-linux.tar.bz2
+tar xjf gcc-arm.tar.bz2
+
+# Python 2.7 + numpy (needed by the .wav encoder)
+"${SHELL}" <(curl -L micro.mamba.pm/install.sh)
+source ~/.bashrc
+micromamba create -y -n py27 -c conda-forge python=2.7 numpy
+micromamba activate py27
+
+# Source
+git clone <this repo> parasites
+cd parasites
+git submodule update --init stmlib stm_audio_bootloader
+
+# Two fixes inside the submodules:
+#  - don't fail the build on warnings from the newer compiler
+sed -i 's/ -Werror//' stmlib/makefile.inc
+#  - the encoder passes a float array size, which newer numpy rejects
+sed -i 's/numpy.zeros((1.0 \* self._sr, 1))/numpy.zeros((int(self._sr), 1))/' stm_audio_bootloader/qpsk/encoder.py
+
+# Build
+touch warps/resources.cc
+mkdir -p build/warps
+PYTHONPATH=. make -f warps/makefile TOOLCHAIN_PATH=$HOME/gcc-arm-none-eabi-7-2018-q2-update/ wav
+```
+
+The firmware update file is `build/warps/warps.wav` (about 12 MB).
+
+## Flashing
+
+1. Unpatch the module and connect your computer's audio output to **IN 1**.
+2. Power on while holding **Int Osc**; its LED blinks orange.
+3. Turn off system sounds, disconnect speakers, set the volume to maximum.
+4. Play the `.wav`. The Algorithm LED shows the level: green/yellow is good,
+   red is too hot (adjust with the Level 1 knob).
+5. Let it play to the end; the module restarts with the new firmware.
