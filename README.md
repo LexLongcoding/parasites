@@ -1,3 +1,7 @@
+   > **Warps tuner fork:** the Warps Doppler panner is replaced by a middle C tuner.
+   > Download the firmware from [Releases](https://github.com/LexLongcoding/parasites/releases)
+   > and see [warps/TUNER.md](warps/TUNER.md) for usage, building and flashing.
+
 Mutable Instruments' Eurorack Modules.
 
 * Braids: Macro-oscillator.
