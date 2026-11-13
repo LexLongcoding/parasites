@@ -69,7 +69,7 @@ micromamba create -y -n py27 -c conda-forge python=2.7 numpy
 micromamba activate py27
 
 # Source
-git clone <this repo> parasites
+git clone https://github.com/lexlongcoding/parasites.git parasites
 cd parasites
 git submodule update --init stmlib stm_audio_bootloader
 
